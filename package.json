@@ -1,0 +1,11 @@
+{
+  "name": "cr-bisector",
+  "version": "0.0.1",
+  "description": "chromium sheriff culprit bisector",
+  "main": "bin/cr-bisect",
+  "author": "wacky6",
+  "license": "MIT",
+  "dependencies": {
+    "yargs": "^16.1.0"
+  }
+}

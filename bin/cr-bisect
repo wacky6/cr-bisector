@@ -1,0 +1,137 @@
+#!/usr/bin/env node
+
+const { promisify } = require('util')
+const fs = require('fs')
+const writeFile = promisify(fs.writeFile)
+
+const { join } = require('path')
+const { expandPath } = require('../lib/expand-path')
+
+// The path to the chromium source code checkout for bisection.
+// Should have a working gclient configuration.
+const BISECT_WORKDIR = expandPath('~/chromium')
+
+// Last known good commit hash.
+const LAST_KNOWN_GOOD = '[GIT_HASH]'
+
+// First broken commit hash.
+const FIRST_BROKEN = '[GIT_HASH]'
+
+const BUILD_CONFIG = 'out/bisect'
+
+// Build config.
+const GN_ARGS = `
+dcheck_always_on = false
+is_chrome_branded = true
+is_debug = false
+symbol_level = 1
+use_remoteexec = true
+`
+
+const BUILD_TARGET = 'browser_tests'
+const EXEC_TARGET = BUILD_TARGET
+const TESTS = '*[TEST_NAME]*'
+
+const GitUtil = require('../lib/git-util')
+
+async function bisect(lastGood, firstBroken) {
+    let bisectLog = []
+    const gitWorkDir = join(BISECT_WORKDIR, 'src')
+    const gitUtil = GitUtil.create(gitWorkDir)
+
+    const hasCommitsLocally = await gitUtil.exec(`git cat-file -t ${firstBroken}`).then(_ => true, _ => false)
+    if (!hasCommitsLocally) {
+        // Need to pull latest commits, so local history is complete from lastGood to firstBroken.
+        await gitUtil.exec(`git fetch origin`)
+    }
+
+    await gitUtil.checkout(firstBroken)
+
+    const revisions = await gitUtil.revisionList(lastGood, firstBroken)
+    if (revisions.length < 2) {
+        return null
+    }
+
+    await gitUtil.gclientSync()
+
+    await gitUtil.exec(`mkdir -p ${BUILD_CONFIG}`)
+    await writeFile(expandPath(join(gitWorkDir, BUILD_CONFIG, 'args.gn')), GN_ARGS)
+    await gitUtil.exec(`gn gen ${BUILD_CONFIG}`)
+
+    let brokenSince = 0
+    let goodAt = revisions.length - 1
+    let currentCheckoutIdx = -1   // Used to determine if a gclient sync is needed.
+    while (brokenSince + 1 !== goodAt) {
+        const midPoint = Math.floor((brokenSince + goodAt) / 2)
+        const tryRev = revisions[midPoint]
+
+        console.log(`--- try revision: ${tryRev.hash.slice(0, 8)} ${tryRev.subject}`)
+        const timeStart = Date.now()
+
+        await gitUtil.checkout(tryRev.hash)
+
+        // Determine if a `gclient sync` is necessary, by looking at subject lines for DEPS change.
+        const lowIdx = Math.min(currentCheckoutIdx, midPoint)
+        const highIdx = Math.max(currentCheckoutIdx, midPoint)
+        const needsGclientSync = (
+            currentCheckoutIdx == -1
+            || revisions
+                .slice(lowIdx, highIdx + 1)
+                .some(rev => rev.subject.match(/Roll/))
+        )
+
+        if (needsGclientSync) {
+            await gitUtil.gclientSync()
+        } else {
+            console.log(`    skip gclient sync for commits:`)
+            for (let i = lowIdx; i != highIdx + 1; ++i) {
+                console.log(`        ${revisions[i].subject}`)
+            }
+        }
+
+        currentCheckoutIdx = midPoint
+
+        // Compile.
+        let ok = await gitUtil.exec(`autoninja -C ${BUILD_CONFIG} ${BUILD_TARGET}`).then(
+            _ => true,
+            _ => false,
+        )
+
+        if (ok) {
+            console.log('    compiles ok')
+
+            ok = await gitUtil.exec(`ASAN_OPTIONS=detect_odr_violation=0 testing/xvfb.py ${BUILD_CONFIG}/${EXEC_TARGET} --gtest_filter='*${TESTS}*' --gtest_repeat=5`).then(
+                _ => true,
+                _ => false
+            )
+            if (ok) {
+                console.log('    test ok')
+                bisectLog.push('P')
+            } else {
+                console.log('    test fails')
+                bisectLog.push('F')
+            }
+        } else {
+            console.log('    compile fails')
+            bisectLog.push('C')
+        }
+
+        if (ok) {
+            goodAt = midPoint
+        } else {
+            brokenSince = midPoint
+        }
+
+        const elapsedTime = Date.now() - timeStart
+        console.log(`--- revision is ${ok ? 'good' : 'broken'}, elapsed time: ${elapsedTime / 1000} seconds`)
+        console.log('')
+    }
+
+    console.log(`--- bisect log: ${bisectLog.join('')}`)
+
+    return revisions[brokenSince]
+}
+
+bisect(LAST_KNOWN_GOOD, FIRST_BROKEN).then(commit => {
+    console.log(`suspect is: ${commit.hash} ${commit.subject}`)
+})
